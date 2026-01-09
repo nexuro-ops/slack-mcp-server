@@ -22,6 +22,52 @@ import (
 )
 
 const defaultUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+// TLSInsecurityOption represents parsed TLS insecurity setting
+type TLSInsecurityOption struct {
+	Enabled bool
+	Source  string // Where this value came from (for logging)
+}
+
+// ParseTLSInsecurityOption parses SLACK_MCP_SERVER_CA_INSECURE with strict boolean validation
+func ParseTLSInsecurityOption(logger *zap.Logger) (TLSInsecurityOption, error) {
+	envValue := os.Getenv("SLACK_MCP_SERVER_CA_INSECURE")
+
+	// Default: secure (verification enabled)
+	if envValue == "" {
+		return TLSInsecurityOption{
+			Enabled: false,
+			Source:  "default",
+		}, nil
+	}
+
+	// Strict parsing: only accept explicit boolean values
+	switch strings.ToLower(strings.TrimSpace(envValue)) {
+	case "true", "1", "yes", "on":
+		return TLSInsecurityOption{
+			Enabled: true,
+			Source:  fmt.Sprintf("SLACK_MCP_SERVER_CA_INSECURE=%q", envValue),
+		}, nil
+
+	case "false", "0", "no", "off":
+		return TLSInsecurityOption{
+			Enabled: false,
+			Source:  fmt.Sprintf("SLACK_MCP_SERVER_CA_INSECURE=%q", envValue),
+		}, nil
+
+	default:
+		// REJECT invalid values - don't make assumptions
+		errMsg := fmt.Sprintf("invalid SLACK_MCP_SERVER_CA_INSECURE value: %q "+
+			"(must be one of: true, false, 1, 0, yes, no, on, off)",
+			envValue)
+		logger.Error("TLS configuration validation failed",
+			zap.String("setting", "SLACK_MCP_SERVER_CA_INSECURE"),
+			zap.String("value", envValue),
+			zap.String("error", errMsg))
+		return TLSInsecurityOption{}, fmt.Errorf("%s", errMsg)
+	}
+}
+
 const toolkitPEM = `-----BEGIN CERTIFICATE-----
 MIIDTzCCAjegAwIBAgIRCvyMzxdGWElNljTLqOyz44owDQYJKoZIhvcNAQELBQAw
 QTEYMBYGA1UEAxMPSFRUUCBUb29sa2l0IENBMQswCQYDVQQGEwJYWDEYMBYGA1UE
@@ -374,13 +420,36 @@ func ProvideHTTPClient(cookies []*http.Cookie, logger *zap.Logger) *http.Client 
 		}
 	}
 
-	insecure := false
-	if os.Getenv("SLACK_MCP_SERVER_CA_INSECURE") != "" {
-		if localCertFile := os.Getenv("SLACK_MCP_SERVER_CA"); localCertFile != "" {
-			logger.Fatal("SLACK_MCP_SERVER_CA and SLACK_MCP_SERVER_CA_INSECURE cannot be used together")
-		}
-		insecure = true
+	// Step 1: Parse TLS insecurity option with strict validation
+	tlsOption, err := ParseTLSInsecurityOption(logger)
+	if err != nil {
+		logger.Fatal("TLS insecurity option parsing failed",
+			zap.Error(err),
+			zap.String("component", "transport"))
 	}
+
+	// Step 2: Prevent using both CA file and insecure mode
+	if tlsOption.Enabled {
+		if localCertFile := os.Getenv("SLACK_MCP_SERVER_CA"); localCertFile != "" {
+			logger.Fatal("SLACK_MCP_SERVER_CA and SLACK_MCP_SERVER_CA_INSECURE cannot be used together",
+				zap.String("component", "transport"))
+		}
+	}
+
+	// Step 3: Log TLS configuration prominently
+	if tlsOption.Enabled {
+		logger.Error("⚠️  CRITICAL SECURITY ISSUE ⚠️",
+			zap.String("issue", "TLS Certificate Verification Disabled"),
+			zap.String("environment_variable", "SLACK_MCP_SERVER_CA_INSECURE=true"),
+			zap.String("risk", "Man-in-the-Middle (MITM) attacks possible"),
+			zap.String("recommendation", "Enable TLS verification in production"),
+			zap.String("component", "transport"))
+	} else {
+		logger.Info("TLS verification enabled (secure)",
+			zap.String("component", "transport"))
+	}
+
+	insecure := tlsOption.Enabled
 
 	userAgent := defaultUA
 	if ua := os.Getenv("SLACK_MCP_USER_AGENT"); ua != "" {

@@ -13,6 +13,21 @@ import (
 	"go.uber.org/zap"
 )
 
+// ValidateSTDIOSource checks if STDIO connection is from valid source (terminal or pipe)
+func ValidateSTDIOSource() bool {
+	stdinStat, _ := os.Stdin.Stat()
+	stdoutStat, _ := os.Stdout.Stat()
+
+	stdinMode := stdinStat.Mode()
+	stdoutMode := stdoutStat.Mode()
+
+	// Valid if connected to TTY (terminal) or pipe
+	isStdinValid := (stdinMode & os.ModeCharDevice) != 0 || (stdinMode & os.ModeNamedPipe) != 0
+	isStdoutValid := (stdoutMode & os.ModeCharDevice) != 0 || (stdoutMode & os.ModeNamedPipe) != 0
+
+	return isStdinValid && isStdoutValid
+}
+
 // authKey is a custom context key for storing the auth token.
 type authKey struct{}
 
@@ -112,6 +127,21 @@ func BuildMiddleware(transport string, logger *zap.Logger) server.ToolHandlerMid
 func IsAuthenticated(ctx context.Context, transport string, logger *zap.Logger) (bool, error) {
 	switch transport {
 	case "stdio":
+		// Step 1: Validate STDIO source (must be terminal or pipe)
+		if !ValidateSTDIOSource() {
+			logger.Error("STDIO authentication failed: invalid source",
+				zap.String("context", "stdio"),
+			)
+			return false, fmt.Errorf("STDIO connection not from valid source (terminal or pipe required)")
+		}
+
+		// Step 2: Log successful STDIO authentication
+		logger.Info("STDIO authentication successful",
+			zap.String("context", "stdio"),
+			zap.Int("pid", os.Getpid()),
+			zap.Int("ppid", os.Getppid()),
+		)
+
 		return true, nil
 
 	case "sse", "http":
