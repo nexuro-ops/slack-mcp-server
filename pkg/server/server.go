@@ -14,11 +14,48 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 	"go.uber.org/zap"
+	"golang.org/x/time/rate"
 )
 
 type MCPServer struct {
 	server *server.MCPServer
 	logger *zap.Logger
+}
+
+// RateLimitedResourceHandler wraps a resource handler with rate limiting
+type RateLimitedResourceHandler struct {
+	handler  func(context.Context, mcp.ReadResourceRequest) ([]mcp.ResourceContents, error)
+	limiter  *rate.Limiter
+	logger   *zap.Logger
+	resource string
+}
+
+// Handle implements the resource handler interface with rate limiting
+func (rl *RateLimitedResourceHandler) Handle(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
+	// Check rate limit
+	if !rl.limiter.Allow() {
+		rl.logger.Warn("Resource rate limit exceeded",
+			zap.String("resource", rl.resource),
+			zap.String("uri", request.Params.URI))
+		return nil, fmt.Errorf("rate limit exceeded for resource: %s", rl.resource)
+	}
+
+	// Delegate to actual handler
+	return rl.handler(ctx, request)
+}
+
+// NewRateLimitedResourceHandler creates a rate-limited wrapper for a resource handler
+func NewRateLimitedResourceHandler(name string,
+	handler func(context.Context, mcp.ReadResourceRequest) ([]mcp.ResourceContents, error),
+	limiter *rate.Limiter,
+	logger *zap.Logger) func(context.Context, mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
+	wrapper := &RateLimitedResourceHandler{
+		handler:  handler,
+		limiter:  limiter,
+		logger:   logger,
+		resource: name,
+	}
+	return wrapper.Handle
 }
 
 func NewMCPServer(provider *provider.ApiProvider, logger *zap.Logger) *MCPServer {
@@ -197,19 +234,24 @@ func NewMCPServer(provider *provider.ApiProvider, logger *zap.Logger) *MCPServer
 		)
 	}
 
+	// Add resource handlers with rate limiting
+	// Rate limit: 1 request per 3 seconds with burst of 3 (matches Tier2 from limiter)
+	channelsLimiter := rate.NewLimiter(rate.Every(3*time.Second), 3)
+	usersLimiter := rate.NewLimiter(rate.Every(3*time.Second), 3)
+
 	s.AddResource(mcp.NewResource(
 		"slack://"+ws+"/channels",
 		"Directory of Slack channels",
 		mcp.WithResourceDescription("This resource provides a directory of Slack channels."),
 		mcp.WithMIMEType("text/csv"),
-	), channelsHandler.ChannelsResource)
+	), NewRateLimitedResourceHandler("channels", channelsHandler.ChannelsResource, channelsLimiter, logger))
 
 	s.AddResource(mcp.NewResource(
 		"slack://"+ws+"/users",
 		"Directory of Slack users",
 		mcp.WithResourceDescription("This resource provides a directory of Slack users."),
 		mcp.WithMIMEType("text/csv"),
-	), conversationsHandler.UsersResource)
+	), NewRateLimitedResourceHandler("users", conversationsHandler.UsersResource, usersLimiter, logger))
 
 	return &MCPServer{
 		server: s,

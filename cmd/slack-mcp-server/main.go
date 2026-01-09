@@ -42,12 +42,17 @@ func main() {
 	p := provider.New(transport, logger)
 	s := server.NewMCPServer(p, logger)
 
-	go func() {
-		var once sync.Once
+	// Create WaitGroup to block until caches are ready
+	var wg sync.WaitGroup
+	wg.Add(2) // Waiting for 2 cache initialization operations
 
-		newUsersWatcher(p, &once, logger)()
-		newChannelsWatcher(p, &once, logger)()
-	}()
+	go newUsersWatcher(p, &wg, logger)()
+	go newChannelsWatcher(p, &wg, logger)()
+
+	// Block until both caches are initialized
+	wg.Wait()
+	logger.Info("Slack MCP Server is fully ready",
+		zap.String("context", "console"))
 
 	switch transport {
 	case "stdio":
@@ -126,8 +131,10 @@ func main() {
 	}
 }
 
-func newUsersWatcher(p *provider.ApiProvider, once *sync.Once, logger *zap.Logger) func() {
+func newUsersWatcher(p *provider.ApiProvider, wg *sync.WaitGroup, logger *zap.Logger) func() {
 	return func() {
+		defer wg.Done()
+
 		logger.Info("Caching users collection...",
 			zap.String("context", "console"),
 		)
@@ -141,25 +148,22 @@ func newUsersWatcher(p *provider.ApiProvider, once *sync.Once, logger *zap.Logge
 
 		err := p.RefreshUsers(context.Background())
 		if err != nil {
-			logger.Fatal("Error booting provider",
+			logger.Fatal("Error caching users",
 				zap.String("context", "console"),
 				zap.Error(err),
 			)
 		}
 
-		ready, _ := p.IsReady()
-		if ready {
-			once.Do(func() {
-				logger.Info("Slack MCP Server is fully ready",
-					zap.String("context", "console"),
-				)
-			})
-		}
+		logger.Info("Users cache initialized successfully",
+			zap.String("context", "console"),
+		)
 	}
 }
 
-func newChannelsWatcher(p *provider.ApiProvider, once *sync.Once, logger *zap.Logger) func() {
+func newChannelsWatcher(p *provider.ApiProvider, wg *sync.WaitGroup, logger *zap.Logger) func() {
 	return func() {
+		defer wg.Done()
+
 		logger.Info("Caching channels collection...",
 			zap.String("context", "console"),
 		)
@@ -173,20 +177,15 @@ func newChannelsWatcher(p *provider.ApiProvider, once *sync.Once, logger *zap.Lo
 
 		err := p.RefreshChannels(context.Background())
 		if err != nil {
-			logger.Fatal("Error booting provider",
+			logger.Fatal("Error caching channels",
 				zap.String("context", "console"),
 				zap.Error(err),
 			)
 		}
 
-		ready, _ := p.IsReady()
-		if ready {
-			once.Do(func() {
-				logger.Info("Slack MCP Server is fully ready.",
-					zap.String("context", "console"),
-				)
-			})
-		}
+		logger.Info("Channels cache initialized successfully",
+			zap.String("context", "console"),
+		)
 	}
 }
 

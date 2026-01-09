@@ -649,28 +649,16 @@ func (ch *ConversationsHandler) parseParamsToolSearch(req mcp.CallToolRequest) (
 	limit := req.GetInt("limit", 100)
 	cursor := req.GetString("cursor", "")
 
-	var (
-		page          int
-		decodedCursor []byte
-	)
+	var page int = 1
 	if cursor != "" {
-		decodedCursor, err = base64.StdEncoding.DecodeString(cursor)
+		// Use hardened validation function
+		validatedCursor, err := ParseAndValidateCursor(cursor)
 		if err != nil {
-			ch.logger.Error("Invalid cursor decoding", zap.String("cursor", cursor), zap.Error(err))
+			// Log only sanitized error, not raw cursor content
+			ch.logger.Error("Cursor validation failed", zap.Error(err))
 			return nil, fmt.Errorf("invalid cursor: %v", err)
 		}
-		parts := strings.Split(string(decodedCursor), ":")
-		if len(parts) != 2 {
-			ch.logger.Error("Invalid cursor format", zap.String("cursor", cursor))
-			return nil, fmt.Errorf("invalid cursor: %v", cursor)
-		}
-		page, err = strconv.Atoi(parts[1])
-		if err != nil || page < 1 {
-			ch.logger.Error("Invalid cursor page", zap.String("cursor", cursor), zap.Error(err))
-			return nil, fmt.Errorf("invalid cursor page: %v", err)
-		}
-	} else {
-		page = 1
+		page = validatedCursor.Page
 	}
 
 	ch.logger.Debug("Search parameters built",
