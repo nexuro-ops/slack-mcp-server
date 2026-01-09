@@ -4,10 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/korotovsky/slack-mcp-server/pkg/limiter"
 	"github.com/korotovsky/slack-mcp-server/pkg/provider/edge"
@@ -28,6 +31,24 @@ var PubChanType = "public_channel"
 
 var ErrUsersNotReady = errors.New(usersNotReadyMsg)
 var ErrChannelsNotReady = errors.New(channelsNotReadyMsg)
+
+// BackoffConfig defines exponential backoff configuration for cache refresh retries
+type BackoffConfig struct {
+	InitialDelay time.Duration
+	MaxDelay     time.Duration
+	Multiplier   float64
+	MaxRetries   int
+}
+
+// Rate limiting constants for cache refresh operations
+const (
+	DefaultRefreshRate        = 1  // 1 refresh per second (conservative)
+	DefaultRefreshBurst       = 2  // Allow burst of 2 for failover scenarios
+	DefaultInitialBackoff     = 1 * time.Second
+	DefaultMaxBackoff         = 60 * time.Second
+	DefaultBackoffMultiplier  = 2.0
+	DefaultMaxRetries         = 3
+)
 
 // getCacheDir returns the appropriate cache directory for slack-mcp-server
 func getCacheDir() string {
@@ -108,6 +129,12 @@ type ApiProvider struct {
 	logger    *zap.Logger
 
 	rateLimiter *rate.Limiter
+
+	// Cache refresh rate limiting
+	refreshLimiter *rate.Limiter
+	backoffConfig  BackoffConfig
+	refreshRetries map[string]int
+	retryMu        sync.RWMutex
 
 	// Users state - protected by usersMu
 	usersMu    sync.RWMutex
@@ -411,6 +438,18 @@ func newWithXOXP(transport string, authProvider auth.ValueAuth, logger *zap.Logg
 
 		rateLimiter: limiter.Tier2.Limiter(),
 
+		// Cache refresh rate limiting
+		refreshLimiter: rate.NewLimiter(
+			rate.Limit(DefaultRefreshRate),
+			DefaultRefreshBurst),
+		backoffConfig: BackoffConfig{
+			InitialDelay: DefaultInitialBackoff,
+			MaxDelay:     DefaultMaxBackoff,
+			Multiplier:   DefaultBackoffMultiplier,
+			MaxRetries:   DefaultMaxRetries,
+		},
+		refreshRetries: make(map[string]int),
+
 		users:      make(map[string]slack.User),
 		usersInv:   map[string]string{},
 		usersCache: usersCache,
@@ -461,6 +500,18 @@ func newWithXOXC(transport string, authProvider auth.ValueAuth, logger *zap.Logg
 
 		rateLimiter: limiter.Tier2.Limiter(),
 
+		// Cache refresh rate limiting
+		refreshLimiter: rate.NewLimiter(
+			rate.Limit(DefaultRefreshRate),
+			DefaultRefreshBurst),
+		backoffConfig: BackoffConfig{
+			InitialDelay: DefaultInitialBackoff,
+			MaxDelay:     DefaultMaxBackoff,
+			Multiplier:   DefaultBackoffMultiplier,
+			MaxRetries:   DefaultMaxRetries,
+		},
+		refreshRetries: make(map[string]int),
+
 		users:      make(map[string]slack.User),
 		usersInv:   map[string]string{},
 		usersCache: usersCache,
@@ -469,6 +520,55 @@ func newWithXOXC(transport string, authProvider auth.ValueAuth, logger *zap.Logg
 		channelsInv:   map[string]string{},
 		channelsCache: channelsCache,
 	}
+}
+
+// calculateBackoff computes exponential backoff duration based on retry count
+func (ap *ApiProvider) calculateBackoff(retryCount int) time.Duration {
+	if retryCount >= ap.backoffConfig.MaxRetries {
+		return ap.backoffConfig.MaxDelay
+	}
+
+	backoff := time.Duration(float64(ap.backoffConfig.InitialDelay) *
+		math.Pow(ap.backoffConfig.Multiplier, float64(retryCount)))
+
+	if backoff > ap.backoffConfig.MaxDelay {
+		backoff = ap.backoffConfig.MaxDelay
+	}
+
+	return backoff
+}
+
+// getRetryCount returns the current retry count for an operation
+func (ap *ApiProvider) getRetryCount(operation string) int {
+	ap.retryMu.RLock()
+	defer ap.retryMu.RUnlock()
+	return ap.refreshRetries[operation]
+}
+
+// incrementRetryCount increases the retry count for an operation
+func (ap *ApiProvider) incrementRetryCount(operation string) {
+	ap.retryMu.Lock()
+	defer ap.retryMu.Unlock()
+	ap.refreshRetries[operation]++
+}
+
+// resetRetryCount resets the retry count for an operation to 0
+func (ap *ApiProvider) resetRetryCount(operation string) {
+	ap.retryMu.Lock()
+	defer ap.retryMu.Unlock()
+	ap.refreshRetries[operation] = 0
+}
+
+// isSlackRateLimitError checks if an error indicates Slack API rate limiting
+func isSlackRateLimitError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	errStr := err.Error()
+	return strings.Contains(errStr, "rate_limited") ||
+		strings.Contains(errStr, "rate limit") ||
+		strings.Contains(errStr, "429")
 }
 
 func (ap *ApiProvider) RefreshUsers(ctx context.Context) error {
@@ -507,10 +607,28 @@ func (ap *ApiProvider) RefreshUsers(ctx context.Context) error {
 		}
 	}
 
+	// Apply rate limiting before API calls
+	if !ap.refreshLimiter.Allow() {
+		ap.logger.Warn("Cache refresh rate limit exceeded",
+			zap.String("operation", "refresh_users"))
+		return fmt.Errorf("rate limit exceeded for user cache refresh")
+	}
+
 	users, err := ap.client.GetUsersContext(ctx,
 		optionLimit,
 	)
 	if err != nil {
+		// Check for Slack rate limit errors
+		if isSlackRateLimitError(err) {
+			retryCount := ap.getRetryCount("users")
+			ap.incrementRetryCount("users")
+			backoff := ap.calculateBackoff(retryCount)
+			ap.logger.Error("Slack rate limit hit during user refresh",
+				zap.Error(err),
+				zap.Int("retry_count", retryCount),
+				zap.Duration("backoff", backoff))
+			return fmt.Errorf("slack rate limited: %w", err)
+		}
 		ap.logger.Error("Failed to fetch users", zap.Error(err))
 		return err
 	} else {
@@ -528,6 +646,17 @@ func (ap *ApiProvider) RefreshUsers(ctx context.Context) error {
 
 	users, err = ap.GetSlackConnect(ctx)
 	if err != nil {
+		// Check for Slack rate limit errors
+		if isSlackRateLimitError(err) {
+			retryCount := ap.getRetryCount("users")
+			ap.incrementRetryCount("users")
+			backoff := ap.calculateBackoff(retryCount)
+			ap.logger.Error("Slack rate limit hit during Slack Connect fetch",
+				zap.Error(err),
+				zap.Int("retry_count", retryCount),
+				zap.Duration("backoff", backoff))
+			return fmt.Errorf("slack rate limited: %w", err)
+		}
 		ap.logger.Error("Failed to fetch users from Slack Connect", zap.Error(err))
 		return err
 	} else {
@@ -560,6 +689,9 @@ func (ap *ApiProvider) RefreshUsers(ctx context.Context) error {
 	ap.usersInv = newUsersInv
 	ap.usersReady = true
 	ap.usersMu.Unlock()
+
+	// Reset retry counter on success
+	ap.resetRetryCount("users")
 
 	return nil
 }
@@ -610,6 +742,13 @@ func (ap *ApiProvider) RefreshChannels(ctx context.Context) error {
 		}
 	}
 
+	// Apply rate limiting before API calls
+	if !ap.refreshLimiter.Allow() {
+		ap.logger.Warn("Cache refresh rate limit exceeded",
+			zap.String("operation", "refresh_channels"))
+		return fmt.Errorf("rate limit exceeded for channel cache refresh")
+	}
+
 	channels := ap.GetChannels(ctx, AllChanTypes)
 
 	if data, err := json.MarshalIndent(channels, "", "  "); err != nil {
@@ -640,6 +779,9 @@ func (ap *ApiProvider) RefreshChannels(ctx context.Context) error {
 	ap.channelsInv = newChannelsInv
 	ap.channelsReady = true
 	ap.channelsMu.Unlock()
+
+	// Reset retry counter on success
+	ap.resetRetryCount("channels")
 
 	return nil
 }
