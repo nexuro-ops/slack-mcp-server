@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/pem"
 	"fmt"
 	"io/ioutil"
 	"net"
@@ -27,6 +28,100 @@ const defaultUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/5
 type TLSInsecurityOption struct {
 	Enabled bool
 	Source  string // Where this value came from (for logging)
+}
+
+// CertificateInfo contains details about a loaded certificate
+type CertificateInfo struct {
+	Subject      string
+	Issuer       string
+	NotBefore    time.Time
+	NotAfter     time.Time
+	DNSNames     []string
+	IsExpired    bool
+	DaysUntilExp float64
+}
+
+// CertificateBundle represents a validated TLS certificate bundle
+type CertificateBundle struct {
+	SystemCAs    *x509.CertPool
+	CustomCerts  []*CertificateInfo
+	IsValid      bool
+	LoadedCount  int
+}
+
+// ParseCertificatesPEM parses PEM-encoded certificates and validates them
+func ParseCertificatesPEM(certPEM []byte, logger *zap.Logger) ([]*CertificateInfo, error) {
+	var certs []*CertificateInfo
+
+	for len(certPEM) > 0 {
+		block, rest := pem.Decode(certPEM)
+		if block == nil {
+			break
+		}
+
+		if block.Type != "CERTIFICATE" {
+			certPEM = rest
+			continue
+		}
+
+		cert, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse certificate: %w", err)
+		}
+
+		// Calculate days until expiration
+		daysUntilExp := time.Until(cert.NotAfter).Hours() / 24
+
+		// Check if expired
+		isExpired := time.Now().After(cert.NotAfter)
+
+		certInfo := &CertificateInfo{
+			Subject:      cert.Subject.String(),
+			Issuer:       cert.Issuer.String(),
+			NotBefore:    cert.NotBefore,
+			NotAfter:     cert.NotAfter,
+			DNSNames:     cert.DNSNames,
+			IsExpired:    isExpired,
+			DaysUntilExp: daysUntilExp,
+		}
+
+		certs = append(certs, certInfo)
+	}
+
+	if len(certs) == 0 {
+		return nil, fmt.Errorf("no valid certificates found in PEM")
+	}
+
+	return certs, nil
+}
+
+// ValidateCertificates checks certificate validity and logs warnings/errors
+func ValidateCertificates(certs []*CertificateInfo, logger *zap.Logger) error {
+	for i, cert := range certs {
+		// FATAL: Certificate is expired
+		if cert.IsExpired {
+			return fmt.Errorf("certificate %d is expired (expired on %v)",
+				i, cert.NotAfter)
+		}
+
+		// FATAL: Certificate not yet valid
+		if time.Now().Before(cert.NotBefore) {
+			return fmt.Errorf("certificate %d not yet valid (starts at %v)",
+				i, cert.NotBefore)
+		}
+
+		// WARNING: Certificate expires within 30 days
+		if cert.DaysUntilExp < 30 && cert.DaysUntilExp > 0 {
+			logger.Warn("Certificate expiring soon",
+				zap.Int("certificate_index", i),
+				zap.String("subject", cert.Subject),
+				zap.Float64("days_until_expiry", cert.DaysUntilExp),
+				zap.Time("expires_at", cert.NotAfter),
+				zap.String("component", "transport"))
+		}
+	}
+
+	return nil
 }
 
 // ParseTLSInsecurityOption parses SLACK_MCP_SERVER_CA_INSECURE with strict boolean validation
@@ -355,6 +450,34 @@ func basicAuth(username, password string) string {
 	return base64.StdEncoding.EncodeToString([]byte(auth))
 }
 
+// logCertificateBundleSummary logs details about loaded certificates
+func logCertificateBundleSummary(bundle *CertificateBundle, logger *zap.Logger) {
+	logger.Info("TLS Certificate Bundle Summary",
+		zap.Bool("is_valid", bundle.IsValid),
+		zap.Int("custom_certificates", len(bundle.CustomCerts)),
+		zap.String("component", "transport"))
+
+	for i, cert := range bundle.CustomCerts {
+		expiresIn := time.Until(cert.NotAfter).Hours() / 24
+
+		fields := []zap.Field{
+			zap.String("subject", cert.Subject),
+			zap.String("issuer", cert.Issuer),
+			zap.Time("not_before", cert.NotBefore),
+			zap.Time("not_after", cert.NotAfter),
+			zap.Float64("expires_in_days", expiresIn),
+			zap.String("component", "transport"),
+		}
+
+		if len(cert.DNSNames) > 0 {
+			fields = append(fields, zap.Strings("dns_names", cert.DNSNames))
+		}
+
+		logger.Info("Certificate Loaded",
+			append([]zap.Field{zap.Int("certificate_index", i)}, fields...)...)
+	}
+}
+
 // detectBrowserFromUserAgent determines the browser type from user agent string
 func detectBrowserFromUserAgent(userAgent string) utls.ClientHelloID {
 	ua := strings.ToLower(userAgent)
@@ -402,23 +525,84 @@ func ProvideHTTPClient(cookies []*http.Cookie, logger *zap.Logger) *http.Client 
 		rootCAs = x509.NewCertPool()
 	}
 
-	if isToolkit := os.Getenv("SLACK_MCP_SERVER_CA_TOOLKIT"); isToolkit != "" {
-		if ok := rootCAs.AppendCertsFromPEM([]byte(toolkitPEM)); !ok {
-			logger.Warn("Failed to append toolkit certificate")
-		}
+	// Build certificate bundle with validation
+	certBundle := &CertificateBundle{
+		SystemCAs:   rootCAs,
+		CustomCerts: []*CertificateInfo{},
+		IsValid:     true,
 	}
 
+	// Step 1: Load and validate toolkit certificate (if enabled)
+	if isToolkit := os.Getenv("SLACK_MCP_SERVER_CA_TOOLKIT"); isToolkit != "" {
+		toolkitCerts, err := ParseCertificatesPEM([]byte(toolkitPEM), logger)
+		if err != nil {
+			logger.Fatal("Failed to parse toolkit certificate",
+				zap.Error(err),
+				zap.String("component", "transport"))
+		}
+
+		// Step 2: Validate toolkit certificates
+		if err := ValidateCertificates(toolkitCerts, logger); err != nil {
+			logger.Fatal("Toolkit certificate validation failed",
+				zap.Error(err),
+				zap.String("component", "transport"))
+		}
+
+		// Step 3: Append to CA pool
+		if ok := rootCAs.AppendCertsFromPEM([]byte(toolkitPEM)); !ok {
+			logger.Fatal("Failed to append toolkit certificate to CA pool",
+				zap.String("component", "transport"))
+		}
+
+		certBundle.CustomCerts = append(certBundle.CustomCerts, toolkitCerts...)
+		logger.Info("Toolkit certificate loaded successfully",
+			zap.Int("count", len(toolkitCerts)),
+			zap.String("component", "transport"))
+	}
+
+	// Step 4: Load and validate local certificate file (if specified)
 	if localCertFile := os.Getenv("SLACK_MCP_SERVER_CA"); localCertFile != "" {
 		certs, err := ioutil.ReadFile(localCertFile)
 		if err != nil {
 			logger.Fatal("Failed to read local certificate file",
 				zap.String("cert_file", localCertFile),
-				zap.Error(err))
+				zap.Error(err),
+				zap.String("component", "transport"))
 		}
+
+		// Step 5: Parse and validate custom certificates
+		customCerts, err := ParseCertificatesPEM(certs, logger)
+		if err != nil {
+			logger.Fatal("Failed to parse custom certificate file",
+				zap.String("cert_file", localCertFile),
+				zap.Error(err),
+				zap.String("component", "transport"))
+		}
+
+		// Step 6: Validate custom certificates
+		if err := ValidateCertificates(customCerts, logger); err != nil {
+			logger.Fatal("Custom certificate validation failed",
+				zap.String("cert_file", localCertFile),
+				zap.Error(err),
+				zap.String("component", "transport"))
+		}
+
+		// Step 7: Append to CA pool
 		if ok := rootCAs.AppendCertsFromPEM(certs); !ok {
-			logger.Warn("No certs appended, using system certs only")
+			logger.Fatal("Failed to append custom certificate to CA pool",
+				zap.String("cert_file", localCertFile),
+				zap.String("component", "transport"))
 		}
+
+		certBundle.CustomCerts = append(certBundle.CustomCerts, customCerts...)
+		logger.Info("Custom certificate loaded successfully",
+			zap.String("cert_file", localCertFile),
+			zap.Int("count", len(customCerts)),
+			zap.String("component", "transport"))
 	}
+
+	// Step 8: Log certificate bundle summary
+	logCertificateBundleSummary(certBundle, logger)
 
 	// Step 1: Parse TLS insecurity option with strict validation
 	tlsOption, err := ParseTLSInsecurityOption(logger)
