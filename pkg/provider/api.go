@@ -4,10 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/korotovsky/slack-mcp-server/pkg/limiter"
 	"github.com/korotovsky/slack-mcp-server/pkg/provider/edge"
@@ -109,11 +109,15 @@ type ApiProvider struct {
 
 	rateLimiter *rate.Limiter
 
+	// Users state - protected by usersMu
+	usersMu    sync.RWMutex
 	users      map[string]slack.User
 	usersInv   map[string]string
 	usersCache string
 	usersReady bool
 
+	// Channels state - protected by channelsMu
+	channelsMu    sync.RWMutex
 	channels      map[string]Channel
 	channelsInv   map[string]string
 	channelsCache string
@@ -474,21 +478,31 @@ func (ap *ApiProvider) RefreshUsers(ctx context.Context) error {
 		optionLimit  = slack.GetUsersOptionLimit(1000)
 	)
 
-	if data, err := ioutil.ReadFile(ap.usersCache); err == nil {
+	if data, err := os.ReadFile(ap.usersCache); err == nil {
 		var cachedUsers []slack.User
 		if err := json.Unmarshal(data, &cachedUsers); err != nil {
 			ap.logger.Warn("Failed to unmarshal users cache, will refetch",
 				zap.String("cache_file", ap.usersCache),
 				zap.Error(err))
 		} else {
+			// Build the maps from cached data
+			newUsersMap := make(map[string]slack.User)
+			newUsersInv := make(map[string]string)
 			for _, u := range cachedUsers {
-				ap.users[u.ID] = u
-				ap.usersInv[u.Name] = u.ID
+				newUsersMap[u.ID] = u
+				newUsersInv[u.Name] = u.ID
 			}
+
+			// Atomically assign the cache
+			ap.usersMu.Lock()
+			ap.users = newUsersMap
+			ap.usersInv = newUsersInv
+			ap.usersReady = true
+			ap.usersMu.Unlock()
+
 			ap.logger.Info("Loaded users from cache",
 				zap.Int("count", len(cachedUsers)),
 				zap.String("cache_file", ap.usersCache))
-			ap.usersReady = true
 			return nil
 		}
 	}
@@ -503,9 +517,12 @@ func (ap *ApiProvider) RefreshUsers(ctx context.Context) error {
 		list = append(list, users...)
 	}
 
+	newUsersMap := make(map[string]slack.User)
+	newUsersInv := make(map[string]string)
+
 	for _, user := range users {
-		ap.users[user.ID] = user
-		ap.usersInv[user.Name] = user.ID
+		newUsersMap[user.ID] = user
+		newUsersInv[user.Name] = user.ID
 		usersCounter++
 	}
 
@@ -518,15 +535,15 @@ func (ap *ApiProvider) RefreshUsers(ctx context.Context) error {
 	}
 
 	for _, user := range users {
-		ap.users[user.ID] = user
-		ap.usersInv[user.Name] = user.ID
+		newUsersMap[user.ID] = user
+		newUsersInv[user.Name] = user.ID
 		usersCounter++
 	}
 
 	if data, err := json.MarshalIndent(list, "", "  "); err != nil {
 		ap.logger.Error("Failed to marshal users for cache", zap.Error(err))
 	} else {
-		if err := ioutil.WriteFile(ap.usersCache, data, 0644); err != nil {
+		if err := os.WriteFile(ap.usersCache, data, 0644); err != nil {
 			ap.logger.Error("Failed to write cache file",
 				zap.String("cache_file", ap.usersCache),
 				zap.Error(err))
@@ -537,19 +554,28 @@ func (ap *ApiProvider) RefreshUsers(ctx context.Context) error {
 		}
 	}
 
+	// Atomically assign the cache
+	ap.usersMu.Lock()
+	ap.users = newUsersMap
+	ap.usersInv = newUsersInv
 	ap.usersReady = true
+	ap.usersMu.Unlock()
 
 	return nil
 }
 
 func (ap *ApiProvider) RefreshChannels(ctx context.Context) error {
-	if data, err := ioutil.ReadFile(ap.channelsCache); err == nil {
+	if data, err := os.ReadFile(ap.channelsCache); err == nil {
 		var cachedChannels []Channel
 		if err := json.Unmarshal(data, &cachedChannels); err != nil {
 			ap.logger.Warn("Failed to unmarshal channels cache, will refetch",
 				zap.String("cache_file", ap.channelsCache),
 				zap.Error(err))
 		} else {
+			// Build the maps from cached data
+			newChannelsMap := make(map[string]Channel)
+			newChannelsInv := make(map[string]string)
+
 			// Re-map channels with current users cache to ensure DM names are populated
 			usersMap := ap.ProvideUsersMap().Users
 			for _, c := range cachedChannels {
@@ -562,17 +588,24 @@ func (ap *ApiProvider) RefreshChannels(ctx context.Context) error {
 						c.IsIM, c.IsMpIM, c.IsPrivate,
 						usersMap,
 					)
-					ap.channels[c.ID] = remappedChannel
-					ap.channelsInv[remappedChannel.Name] = c.ID
+					newChannelsMap[c.ID] = remappedChannel
+					newChannelsInv[remappedChannel.Name] = c.ID
 				} else {
-					ap.channels[c.ID] = c
-					ap.channelsInv[c.Name] = c.ID
+					newChannelsMap[c.ID] = c
+					newChannelsInv[c.Name] = c.ID
 				}
 			}
+
+			// Atomically assign the cache
+			ap.channelsMu.Lock()
+			ap.channels = newChannelsMap
+			ap.channelsInv = newChannelsInv
+			ap.channelsReady = true
+			ap.channelsMu.Unlock()
+
 			ap.logger.Info("Loaded channels from cache and re-mapped DM names",
 				zap.Int("count", len(cachedChannels)),
 				zap.String("cache_file", ap.channelsCache))
-			ap.channelsReady = true
 			return nil
 		}
 	}
@@ -582,7 +615,7 @@ func (ap *ApiProvider) RefreshChannels(ctx context.Context) error {
 	if data, err := json.MarshalIndent(channels, "", "  "); err != nil {
 		ap.logger.Error("Failed to marshal channels for cache", zap.Error(err))
 	} else {
-		if err := ioutil.WriteFile(ap.channelsCache, data, 0644); err != nil {
+		if err := os.WriteFile(ap.channelsCache, data, 0644); err != nil {
 			ap.logger.Error("Failed to write cache file",
 				zap.String("cache_file", ap.channelsCache),
 				zap.Error(err))
@@ -593,7 +626,20 @@ func (ap *ApiProvider) RefreshChannels(ctx context.Context) error {
 		}
 	}
 
+	// Build the maps
+	newChannelsMap := make(map[string]Channel)
+	newChannelsInv := make(map[string]string)
+	for _, c := range channels {
+		newChannelsMap[c.ID] = c
+		newChannelsInv[c.Name] = c.ID
+	}
+
+	// Atomically assign the cache
+	ap.channelsMu.Lock()
+	ap.channels = newChannelsMap
+	ap.channelsInv = newChannelsInv
 	ap.channelsReady = true
+	ap.channelsMu.Unlock()
 
 	return nil
 }
@@ -605,13 +651,17 @@ func (ap *ApiProvider) GetSlackConnect(ctx context.Context) ([]slack.User, error
 		return nil, err
 	}
 
+	// Get a thread-safe copy of users map
+	usersCache := ap.ProvideUsersMap()
+	usersMap := usersCache.Users
+
 	var collectedIDs []string
 	for _, im := range boot.IMs {
 		if !im.IsShared && !im.IsExtShared {
 			continue
 		}
 
-		_, ok := ap.users[im.User]
+		_, ok := usersMap[im.User]
 		if !ok {
 			collectedIDs = append(collectedIDs, im.User)
 		}
@@ -702,14 +752,9 @@ func (ap *ApiProvider) GetChannels(ctx context.Context, channelTypes []string) [
 		chans = append(chans, typeChannels...)
 	}
 
-	for _, ch := range chans {
-		ap.channels[ch.ID] = ch
-		ap.channelsInv[ch.Name] = ch.ID
-	}
-
 	var res []Channel
 	for _, t := range channelTypes {
-		for _, channel := range ap.channels {
+		for _, channel := range chans {
 			if t == "public_channel" && !channel.IsPrivate {
 				res = append(res, channel)
 			}
@@ -729,6 +774,9 @@ func (ap *ApiProvider) GetChannels(ctx context.Context, channelTypes []string) [
 }
 
 func (ap *ApiProvider) ProvideUsersMap() *UsersCache {
+	ap.usersMu.RLock()
+	defer ap.usersMu.RUnlock()
+
 	return &UsersCache{
 		Users:    ap.users,
 		UsersInv: ap.usersInv,
@@ -736,6 +784,9 @@ func (ap *ApiProvider) ProvideUsersMap() *UsersCache {
 }
 
 func (ap *ApiProvider) ProvideChannelsMaps() *ChannelsCache {
+	ap.channelsMu.RLock()
+	defer ap.channelsMu.RUnlock()
+
 	return &ChannelsCache{
 		Channels:    ap.channels,
 		ChannelsInv: ap.channelsInv,
@@ -743,12 +794,22 @@ func (ap *ApiProvider) ProvideChannelsMaps() *ChannelsCache {
 }
 
 func (ap *ApiProvider) IsReady() (bool, error) {
-	if !ap.usersReady {
+	ap.usersMu.RLock()
+	usersReady := ap.usersReady
+	ap.usersMu.RUnlock()
+
+	if !usersReady {
 		return false, ErrUsersNotReady
 	}
-	if !ap.channelsReady {
+
+	ap.channelsMu.RLock()
+	channelsReady := ap.channelsReady
+	ap.channelsMu.RUnlock()
+
+	if !channelsReady {
 		return false, ErrChannelsNotReady
 	}
+
 	return true, nil
 }
 
